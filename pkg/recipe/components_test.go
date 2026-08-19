@@ -266,6 +266,16 @@ func TestComponentRegistry_NodeSchedulingPaths(t *testing.T) {
 	}
 }
 
+// TestComponentRegistry_K8sAIBOMContract pins the k8s-aibom registry
+// properties that encode *intent* — the ones a rename, a reshuffle, or a
+// well-meaning cleanup would silently break without any other test noticing.
+//
+// It deliberately does NOT restate the chart repository, chart name, version,
+// or namespace. Those are verbatim copies of recipes/registry.yaml with no
+// independent source of truth, so asserting them detects nothing and turns
+// every routine chart bump into a two-file edit. Version drift specifically is
+// already gated by TestCommittedBOMVersionsMatchRegistry, which compares the
+// registry pin against the committed BOM.
 func TestComponentRegistry_K8sAIBOMContract(t *testing.T) {
 	registry, err := GetComponentRegistry()
 	if err != nil {
@@ -277,21 +287,17 @@ func TestComponentRegistry_K8sAIBOMContract(t *testing.T) {
 		t.Fatal("k8s-aibom not found in registry")
 	}
 
-	if component.Helm.DefaultRepository != "oci://ghcr.io/googlecloudplatform/charts" {
-		t.Errorf("repository = %q", component.Helm.DefaultRepository)
-	}
-	if component.Helm.DefaultChart != "k8s-aibom" {
-		t.Errorf("chart = %q", component.Helm.DefaultChart)
-	}
-	if component.Helm.DefaultVersion != "1.2.0" {
-		t.Errorf("version = %q", component.Helm.DefaultVersion)
-	}
-	if component.Helm.DefaultNamespace != "k8s-aibom-system" {
-		t.Errorf("namespace = %q", component.Helm.DefaultNamespace)
-	}
+	// The chart ships its CRDs under crds/ AND renders AIBOMControllerConfig
+	// from templates/, so helm-diff cannot resolve that CR on a fresh cluster.
+	// Losing this flag produces a Helmfile release without
+	// disableValidation: true, which fails only at deploy time on a clean
+	// cluster — far from the change that caused it.
 	if !component.HasSelfRefCRDs {
-		t.Error("hasSelfRefCRDs must be enabled")
+		t.Error("hasSelfRefCRDs must be enabled: the chart renders a CR whose CRD it also ships")
 	}
+	// Renaming or dropping the check file turns the component's deployment
+	// gate into a no-op; the generic RequiresHealthCheck test proves *a* file
+	// resolves, this proves it is still the k8s-aibom one.
 	if component.HealthCheck.AssertFile != "checks/k8s-aibom/health-check.yaml" {
 		t.Errorf("health check = %q", component.HealthCheck.AssertFile)
 	}

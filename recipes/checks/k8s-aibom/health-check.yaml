@@ -34,10 +34,22 @@ spec:
               metadata:
                 name: k8s-aibom
                 namespace: k8s-aibom-system
-              # Root-level expression compares desired and available counts;
-              # defaulting absent fields to zero makes absence/partial rollout
-              # fail rather than pass vacuously.
-              (((spec.replicas || `0`) > `0`) && ((status.availableReplicas || `0`) == spec.replicas)): true
+              # Four independent root-level expressions rather than one
+              # conjunction: each failure names the specific condition that
+              # was not met. Every status field read here is `omitempty` and
+              # therefore absent on a freshly created Deployment, so each
+              # defaults to zero — absence must fail, not compare as null.
+              #
+              # availableReplicas alone is not a rollout gate: mid-upgrade a
+              # Deployment can have availableReplicas == spec.replicas while
+              # the *old* ReplicaSet still owns every available pod. The
+              # updatedReplicas and observedGeneration terms are what make
+              # this assert describe the revision Helm just applied rather
+              # than the one it replaced.
+              ((spec.replicas || `0`) > `0`): true
+              ((status.availableReplicas || `0`) == spec.replicas): true
+              ((status.updatedReplicas || `0`) == spec.replicas): true
+              ((status.observedGeneration || `0`) == metadata.generation): true
     - name: validate-current-controller-configuration
       try:
         - assert:

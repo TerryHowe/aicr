@@ -16,12 +16,33 @@ package chainsaw
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/NVIDIA/aicr/pkg/recipe"
 )
 
+// deploymentStatus models the k8s-aibom controller Deployment's status for one
+// table case. Every field is a pointer so a case can distinguish "the API
+// reports zero" from "the API omits the field entirely" — every status field
+// the health check reads is `omitempty`, so absence is the state a freshly
+// created Deployment is actually in, and it is the state the check's
+// `|| `0` defaults exist to handle.
+type deploymentStatus struct {
+	available          *int64
+	updated            *int64
+	observedGeneration *int64
+}
+
+// TestK8sAIBOMHealthCheckClusterStates drives the shipped health check through
+// the in-process executor against synthetic cluster states.
+//
+// Each case pins wantOutput, not just the pass/fail verdict. Without it every
+// negative case would still pass if the *Deployment* step were the thing
+// breaking — a test that cannot tell which assertion caught the fault does not
+// protect the assertion it claims to. wantOutput names the resource kind whose
+// step must be the one that fails.
 func TestK8sAIBOMHealthCheckClusterStates(t *testing.T) {
 	t.Parallel()
 
@@ -31,51 +52,132 @@ func TestK8sAIBOMHealthCheckClusterStates(t *testing.T) {
 		t.Fatalf("read health check: %v", err)
 	}
 
+	// healthyDeployment is the steady state every case starts from: a
+	// single-replica rollout that has fully converged on generation 3.
+	healthyDeployment := deploymentStatus{available: new(int64(1)), updated: new(int64(1)), observedGeneration: new(int64(3))}
+
 	tests := []struct {
-		name               string
-		desired            int64
-		available          int64
+		name string
+		// Deployment inputs.
+		desired            *int64
+		deploymentGen      int64
+		status             deploymentStatus
+		omitDeploymentSpec bool
+		// AIBOMControllerConfig inputs.
 		configPresent      bool
+		omitConfigStatus   bool
 		generation         int64
 		observedGeneration int64
 		readyGeneration    int64
 		readyStatus        string
-		wantPass           bool
+		// Expectations.
+		wantPass   bool
+		wantOutput string
 	}{
 		{
 			name:    "healthy rollout and current Ready condition",
-			desired: 1, available: 1, configPresent: true,
-			generation: 2, observedGeneration: 2, readyGeneration: 2, readyStatus: "True",
+			desired: new(int64(1)), deploymentGen: 3, status: healthyDeployment,
+			configPresent: true,
+			generation:    2, observedGeneration: 2, readyGeneration: 2, readyStatus: "True",
 			wantPass: true,
 		},
 		{
 			name:    "zero desired replicas fails closed",
-			desired: 0, available: 0, configPresent: true,
-			generation: 2, observedGeneration: 2, readyGeneration: 2, readyStatus: "True",
+			desired: new(int64(0)), deploymentGen: 3,
+			status:        deploymentStatus{available: new(int64(0)), updated: new(int64(0)), observedGeneration: new(int64(3))},
+			configPresent: true,
+			generation:    2, observedGeneration: 2, readyGeneration: 2, readyStatus: "True",
+			wantOutput: "Deployment",
 		},
 		{
 			name:    "partial rollout fails closed",
-			desired: 2, available: 1, configPresent: true,
-			generation: 2, observedGeneration: 2, readyGeneration: 2, readyStatus: "True",
+			desired: new(int64(2)), deploymentGen: 3,
+			status:        deploymentStatus{available: new(int64(1)), updated: new(int64(2)), observedGeneration: new(int64(3))},
+			configPresent: true,
+			generation:    2, observedGeneration: 2, readyGeneration: 2, readyStatus: "True",
+			wantOutput: "Deployment",
+		},
+		{
+			// The pre-upgrade-ReplicaSet trap: availableReplicas already
+			// equals spec.replicas because the OLD pods are the available
+			// ones, while the new revision has zero updated replicas.
+			// Without the updatedReplicas term this state reports healthy.
+			name:    "converged old ReplicaSet mid-upgrade fails closed",
+			desired: new(int64(2)), deploymentGen: 4,
+			status:        deploymentStatus{available: new(int64(2)), updated: new(int64(0)), observedGeneration: new(int64(4))},
+			configPresent: true,
+			generation:    2, observedGeneration: 2, readyGeneration: 2, readyStatus: "True",
+			wantOutput: "Deployment",
+		},
+		{
+			// The apiserver has accepted a new spec but the Deployment
+			// controller has not observed it, so every replica count still
+			// describes the previous generation.
+			name:    "unobserved Deployment generation fails closed",
+			desired: new(int64(1)), deploymentGen: 5,
+			status:        deploymentStatus{available: new(int64(1)), updated: new(int64(1)), observedGeneration: new(int64(4))},
+			configPresent: true,
+			generation:    2, observedGeneration: 2, readyGeneration: 2, readyStatus: "True",
+			wantOutput: "Deployment",
+		},
+		{
+			// A freshly created Deployment: the whole status subresource is
+			// still absent. This is what the `|| `0` defaults are for; without
+			// them the comparisons evaluate against null.
+			name:    "absent Deployment status fields fail closed",
+			desired: new(int64(1)), deploymentGen: 1,
+			status:        deploymentStatus{},
+			configPresent: true,
+			generation:    2, observedGeneration: 2, readyGeneration: 2, readyStatus: "True",
+			wantOutput: "Deployment",
+		},
+		{
+			// spec.replicas omitted entirely. The apiserver defaults it, but
+			// the check must not report healthy off a manifest that never
+			// reached defaulting.
+			name:               "absent spec.replicas fails closed",
+			deploymentGen:      1,
+			omitDeploymentSpec: true,
+			status:             healthyDeployment,
+			configPresent:      true,
+			generation:         2, observedGeneration: 2, readyGeneration: 2, readyStatus: "True",
+			wantOutput: "Deployment",
 		},
 		{
 			name:    "missing controller config fails closed",
-			desired: 1, available: 1,
+			desired: new(int64(1)), deploymentGen: 3, status: healthyDeployment,
+			wantOutput: "AIBOMControllerConfig",
+		},
+		{
+			// Config exists but has never been reconciled, so status is
+			// absent: no observedGeneration and no conditions array. Exercises
+			// both the `|| `0` and the `|| `[]` defaults on the config step.
+			name:    "absent controller config status fails closed",
+			desired: new(int64(1)), deploymentGen: 3, status: healthyDeployment,
+			configPresent: true, omitConfigStatus: true,
+			generation: 2,
+			wantOutput: "AIBOMControllerConfig",
 		},
 		{
 			name:    "stale top-level status fails closed",
-			desired: 1, available: 1, configPresent: true,
-			generation: 2, observedGeneration: 1, readyGeneration: 2, readyStatus: "True",
+			desired: new(int64(1)), deploymentGen: 3, status: healthyDeployment,
+			configPresent: true,
+			generation:    2, observedGeneration: 1, readyGeneration: 2, readyStatus: "True",
+			wantOutput: "AIBOMControllerConfig",
 		},
 		{
 			name:    "stale Ready condition fails closed",
-			desired: 1, available: 1, configPresent: true,
-			generation: 2, observedGeneration: 2, readyGeneration: 1, readyStatus: "True",
+			desired: new(int64(1)), deploymentGen: 3, status: healthyDeployment,
+			configPresent: true,
+			generation:    2, observedGeneration: 2, readyGeneration: 1, readyStatus: "True",
+			wantOutput: "AIBOMControllerConfig",
 		},
 		{
 			name:    "Ready false fails closed",
-			desired: 1, available: 1, configPresent: true,
-			generation: 2, observedGeneration: 2, readyGeneration: 2, readyStatus: "False",
+			desired: new(int64(1)), deploymentGen: 3, status: healthyDeployment,
+			configPresent: true,
+			generation:    2, observedGeneration: 2, readyGeneration: 2, readyStatus: "False",
+			wantOutput: "AIBOMControllerConfig",
 		},
 	}
 
@@ -84,33 +186,53 @@ func TestK8sAIBOMHealthCheckClusterStates(t *testing.T) {
 			t.Parallel()
 
 			fetcher := newFakeFetcher()
+
+			deploymentSpec := map[string]any{}
+			if !tt.omitDeploymentSpec {
+				deploymentSpec["replicas"] = *tt.desired
+			}
+			deploymentStatusObj := map[string]any{}
+			if tt.status.available != nil {
+				deploymentStatusObj["availableReplicas"] = *tt.status.available
+			}
+			if tt.status.updated != nil {
+				deploymentStatusObj["updatedReplicas"] = *tt.status.updated
+			}
+			if tt.status.observedGeneration != nil {
+				deploymentStatusObj["observedGeneration"] = *tt.status.observedGeneration
+			}
 			fetcher.addGet("apps/v1", "Deployment", "k8s-aibom-system", "k8s-aibom", map[string]any{
 				"apiVersion": "apps/v1",
 				"kind":       "Deployment",
 				"metadata": map[string]any{
-					"name":      "k8s-aibom",
-					"namespace": "k8s-aibom-system",
+					"name":       "k8s-aibom",
+					"namespace":  "k8s-aibom-system",
+					"generation": tt.deploymentGen,
 				},
-				"spec":   map[string]any{"replicas": tt.desired},
-				"status": map[string]any{"availableReplicas": tt.available},
+				"spec":   deploymentSpec,
+				"status": deploymentStatusObj,
 			})
+
 			if tt.configPresent {
-				fetcher.addGet("aibom.k8saibom.dev/v1alpha1", "AIBOMControllerConfig", "", "default", map[string]any{
+				config := map[string]any{
 					"apiVersion": "aibom.k8saibom.dev/v1alpha1",
 					"kind":       "AIBOMControllerConfig",
 					"metadata": map[string]any{
 						"name":       "default",
 						"generation": tt.generation,
 					},
-					"status": map[string]any{
+				}
+				if !tt.omitConfigStatus {
+					config["status"] = map[string]any{
 						"observedGeneration": tt.observedGeneration,
 						"conditions": []any{map[string]any{
 							"type":               "Ready",
 							"status":             tt.readyStatus,
 							"observedGeneration": tt.readyGeneration,
 						}},
-					},
-				})
+					}
+				}
+				fetcher.addGet("aibom.k8saibom.dev/v1alpha1", "AIBOMControllerConfig", "", "default", config)
 			}
 
 			result := runChainsawTestInProcess(
@@ -118,6 +240,10 @@ func TestK8sAIBOMHealthCheckClusterStates(t *testing.T) {
 			)
 			if result.Passed != tt.wantPass {
 				t.Fatalf("passed = %v, want %v (output: %s)", result.Passed, tt.wantPass, result.Output)
+			}
+			if tt.wantOutput != "" && !strings.Contains(result.Output, tt.wantOutput) {
+				t.Fatalf("output = %q, want it to name %q — the wrong assertion caught this state",
+					result.Output, tt.wantOutput)
 			}
 		})
 	}
