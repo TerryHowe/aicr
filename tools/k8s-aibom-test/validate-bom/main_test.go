@@ -122,36 +122,64 @@ func TestReadBounded(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-
-	smallPath := filepath.Join(dir, "small")
-	if err := os.WriteFile(smallPath, []byte("content"), 0o600); err != nil {
-		t.Fatalf("write small input: %v", err)
-	}
-	data, err := readBounded(smallPath)
-	if err != nil {
-		t.Fatalf("readBounded() error = %v", err)
-	}
-	if string(data) != "content" {
-		t.Errorf("readBounded() = %q, want content", data)
+	write := func(name string, content []byte) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, content, 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return path
 	}
 
-	// One byte over the cap must be refused, not truncated — a truncated BOM
-	// would fail to decode and report a misleading parse error.
-	largePath := filepath.Join(dir, "large")
-	if err := os.WriteFile(largePath, bytes.Repeat([]byte{'x'}, maxInputBytes+1), 0o600); err != nil {
-		t.Fatalf("write large input: %v", err)
+	tests := []struct {
+		name string
+		path string
+		// wantData is checked only when wantCode is nil.
+		wantData string
+		wantCode *projecterrors.StructuredError
+	}{
+		{
+			name:     "reads a file under the cap",
+			path:     write("small", []byte("content")),
+			wantData: "content",
+		},
+		{
+			name: "reads a file exactly at the cap",
+			path: write("exact", bytes.Repeat([]byte{'x'}, maxInputBytes)),
+			// Boundary case: the LimitReader is given maxInputBytes+1, so an
+			// off-by-one in the comparison would reject a legal document.
+			wantData: string(bytes.Repeat([]byte{'x'}, maxInputBytes)),
+		},
+		{
+			name: "refuses one byte over the cap",
+			path: write("large", bytes.Repeat([]byte{'x'}, maxInputBytes+1)),
+			// Refused, not truncated: a truncated BOM fails to decode and
+			// reports a misleading parse error instead of a size error.
+			wantCode: projecterrors.New(projecterrors.ErrCodeInvalidRequest, ""),
+		},
+		{
+			name:     "missing file",
+			path:     filepath.Join(dir, "missing"),
+			wantCode: projecterrors.New(projecterrors.ErrCodeNotFound, ""),
+		},
 	}
-	if _, err := readBounded(largePath); !stderrors.Is(
-		err, projecterrors.New(projecterrors.ErrCodeInvalidRequest, ""),
-	) {
 
-		t.Errorf("readBounded(large) error = %v, want ErrCodeInvalidRequest", err)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	if _, err := readBounded(filepath.Join(dir, "missing")); !stderrors.Is(
-		err, projecterrors.New(projecterrors.ErrCodeNotFound, ""),
-	) {
-
-		t.Errorf("readBounded(missing) error = %v, want ErrCodeNotFound", err)
+			data, err := readBounded(tt.path)
+			if tt.wantCode != nil {
+				if !stderrors.Is(err, tt.wantCode) {
+					t.Fatalf("readBounded() error = %v, want code %v", err, tt.wantCode)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("readBounded() error = %v, want nil", err)
+			}
+			if string(data) != tt.wantData {
+				t.Errorf("readBounded() returned %d bytes, want %d", len(data), len(tt.wantData))
+			}
+		})
 	}
 }

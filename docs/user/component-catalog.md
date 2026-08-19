@@ -382,9 +382,22 @@ client-side apply depends on. Argo CD and Flux replace CRDs on sync when the
 chart is rendered through them, so this step is specific to the `helm` and
 `helmfile` deployers.
 
-Before uninstalling, remove the component reference from the custom overlay and
-regenerate the recipe, then uninstall the release with the deployer-appropriate
-procedure in [Bundle Uninstall](cli-reference.md#bundle-uninstall).
+Uninstall in this order. Removing the component from the overlay and applying a
+regenerated bundle does **not** remove the previously installed release: the
+`helm` and `helmfile` deployers install releases by name, and a release the new
+bundle no longer mentions is simply left alone. Skipping the explicit uninstall
+leaves the controller running while the next step deletes the CRs and CRDs
+underneath it, so it reconciles against resources that are disappearing.
+
+1. Remove the component reference from the custom overlay and regenerate the
+   recipe and bundle.
+2. Uninstall the release with the deployer-appropriate procedure in
+   [Bundle Uninstall](cli-reference.md#bundle-uninstall) — `helm uninstall
+   k8s-aibom -n k8s-aibom-system` for the `helm` deployer, `helmfile destroy`
+   for Helmfile bundles, deleting the owning `Application` for Argo CD, and the
+   `HelmRelease` for Flux. Confirm the controller Deployment is gone before
+   continuing.
+3. Only then delete retained AIBOMs and, last, the CRDs.
 
 Deleting the CRDs cascades to every AIBOM stored cluster-wide, including any
 belonging to a namespace or release you did not intend to touch. Enumerate

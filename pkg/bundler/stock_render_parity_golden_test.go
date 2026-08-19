@@ -48,10 +48,15 @@ const (
 	// golden rather than dropping out of the comparison.
 	renderErrorSentinel = "render-error"
 
-	// stockRenderBudget bounds one leaf's Make call. Generous for a local
-	// render into a temp dir, short enough that a wedged bundler fails the
-	// test instead of stalling the suite.
-	stockRenderBudget = 60 * time.Second
+	// stockRenderBudget bounds the ENTIRE render loop, not one leaf.
+	//
+	// A per-leaf cap does not bound the test: 45 leaves times a 60s cap is 45
+	// minutes, well past the 10m -timeout in .settings.yaml, so a wedged
+	// bundler would blow the package timeout and produce a panic stack instead
+	// of a named test failure. One loop-wide budget bounds the worst case at a
+	// known value no matter how the catalog grows. Measured runtime is ~12s
+	// without -race, so this is roughly 25x headroom.
+	stockRenderBudget = 5 * time.Minute
 )
 
 // TestStockRenderParityGolden pins the rendered bundle bytes of every leaf
@@ -75,7 +80,8 @@ const (
 //
 //	AICR_UPDATE_GOLDEN=1 go test ./pkg/bundler/ -run TestStockRenderParityGolden
 func TestStockRenderParityGolden(t *testing.T) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), stockRenderBudget)
+	defer cancel()
 
 	leaves, err := recipe.ResolveLeaves(ctx, recipe.ResolveLeavesOptions{
 		Version: stockRenderVersion,
@@ -176,9 +182,7 @@ func renderLeafDigest(ctx context.Context, t *testing.T, rr *recipe.RecipeResult
 	}
 
 	outputDir := t.TempDir()
-	makeCtx, cancel := context.WithTimeout(ctx, stockRenderBudget)
-	defer cancel()
-	if _, err := b.Make(makeCtx, rr, outputDir); err != nil {
+	if _, err := b.Make(ctx, rr, outputDir); err != nil {
 		return "", fmt.Errorf("make: %w", err)
 	}
 	return digestTree(outputDir)

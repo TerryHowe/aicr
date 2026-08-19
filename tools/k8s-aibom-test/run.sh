@@ -47,6 +47,29 @@ SCHED_VALUE=aicr-system
 OUTPUT_DIR=${OUTPUT_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/aicr-aibom-evidence.XXXXXX")}
 mkdir -p "${OUTPUT_DIR}"
 
+# The Kind context this test is allowed to touch. Every destructive step is
+# gated on the active context matching it exactly.
+CLUSTER_NAME=$(yq -r '.testing.component_test.cluster_name // "aicr-component-test"' \
+    "${REPO_ROOT}/.settings.yaml")
+EXPECTED_CONTEXT="kind-${CLUSTER_NAME}"
+
+fail() {
+    log_error "$*"
+    exit 1
+}
+
+# require_expected_context refuses to proceed unless kubectl is pointed at the
+# disposable Kind cluster. Both the test body and the cleanup trap call it:
+# cleanup uninstalls a Helm release and deletes a namespace, and the shared
+# harness switches the caller's kubeconfig context rather than using a private
+# one, so an unguarded cleanup would run those deletions against whatever
+# cluster the caller happened to be pointed at.
+require_expected_context() {
+    local current
+    current=$(kubectl config current-context 2>/dev/null || true)
+    [[ "${current}" == "${EXPECTED_CONTEXT}" ]] || return 1
+}
+
 cleanup() {
     local rc=$?
     # The evidence directory is never removed, on success or failure: the
@@ -61,15 +84,17 @@ cleanup() {
         log_warning "Evidence: ${OUTPUT_DIR}"
         return "${rc}"
     fi
+    # Fail safe, not open: if the context is not the disposable Kind cluster,
+    # skip teardown entirely and say so, rather than deleting from whatever
+    # cluster is active.
+    if ! require_expected_context; then
+        log_warning "Active context is not ${EXPECTED_CONTEXT}; skipping teardown"
+        log_warning "If the test cluster still exists, clean it up with: make component-cleanup COMPONENT=${COMPONENT}"
+        return "${rc}"
+    fi
     kubectl delete namespace "${FIXTURE_NS}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     COMPONENT="${COMPONENT}" bash "${REPO_ROOT}/tools/component-test/cleanup.sh" >/dev/null 2>&1 || true
     return "${rc}"
-}
-trap cleanup EXIT
-
-fail() {
-    log_error "$*"
-    exit 1
 }
 
 # wait_for_aibom_generation blocks until the AIBOM's status has observed the
@@ -138,6 +163,13 @@ capture_aibom() {
 
 log_info "Ensuring the shared component-test Kind cluster"
 TIER=deploy bash "${REPO_ROOT}/tools/component-test/ensure-cluster.sh"
+
+# Arm teardown only now. Before this point nothing has been created, and the
+# active context may still be the caller's own cluster; a trap armed earlier
+# would delete a namespace and uninstall a release from it if setup failed.
+require_expected_context \
+    || fail "expected context ${EXPECTED_CONTEXT} after ensure-cluster.sh, got $(kubectl config current-context 2>/dev/null || echo none)"
+trap cleanup EXIT
 
 # Must precede the install: the bundle sets a nodeSelector, so an unlabeled
 # node would leave the controller Pending and the health check would fail for

@@ -15,7 +15,11 @@
 package bundler
 
 import (
+	"bytes"
 	"context"
+	stderrors "errors"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -171,28 +175,119 @@ func bundleK8sAIBOM(t *testing.T, deployer config.DeployerType) string {
 func TestK8sAIBOM_AllDeployersCarrySecureDefaults(t *testing.T) {
 	digest := qualifiedImageDigest(t)
 
-	// Each entry is a literal that MUST reach the rendered bundle, paired with
-	// the ADR-019 decision it enforces.
-	required := []struct {
+	// Values, not key names. A search for the bare key "strictConfig" is
+	// satisfied by "strictConfig: false" — the exact inversion the assertion
+	// exists to catch — so booleans are parsed out of the rendered YAML and
+	// compared as typed values. The two literals below are safe as substrings
+	// precisely because each IS a value: no inversion of them still matches.
+	requiredLiterals := []struct {
 		literal string
 		why     string
 	}{
 		{digest, "ADR-006 / ADR-019 Decision 4: the controller image is digest-pinned"},
-		{"strictConfig", "ADR-019 Decision 5: readiness reflects current config, not just liveness"},
-		{"sinkSecretAccess", "ADR-019 Decision 6: Secret access is absent while sinks are disabled"},
 		{aibomSchedulingValue, "ADR-019 Decision 5: controller scheduling uses the system node paths"},
+	}
+	requiredValues := []struct {
+		key  string
+		want any
+		why  string
+	}{
+		{"strictConfig", true, "ADR-019 Decision 5: readiness reflects current config, not just liveness"},
+		{"sinkSecretAccess", false, "ADR-019 Decision 6: Secret access is absent while sinks are disabled"},
 	}
 
 	for _, tc := range k8sAIBOMDeployers {
 		t.Run(tc.name, func(t *testing.T) {
 			outputDir := bundleK8sAIBOM(t, tc.deployer)
-			for _, req := range required {
+
+			for _, req := range requiredLiterals {
 				if !bundleContainsBoth(t, outputDir, req.literal, req.literal) {
 					t.Errorf("%s: no rendered file contains %q — %s", tc.name, req.literal, req.why)
 				}
 			}
+
+			for _, req := range requiredValues {
+				found := collectRenderedValues(t, outputDir, req.key)
+				if len(found) == 0 {
+					t.Errorf("%s: no rendered file sets %q — %s", tc.name, req.key, req.why)
+					continue
+				}
+				// Every occurrence must agree. A bundle that emits the key
+				// twice with different values (e.g. a wrapper default shadowing
+				// the component value) is a real defect, and asserting only the
+				// first match would hide it.
+				for _, got := range found {
+					if got != req.want {
+						t.Errorf("%s: rendered %s = %v, want %v (%d occurrence(s): %v) — %s",
+							tc.name, req.key, got, req.want, len(found), found, req.why)
+					}
+				}
+			}
 		})
 	}
+}
+
+// collectRenderedValues walks every YAML document in a rendered bundle and
+// returns each value found under the given key, at any depth.
+//
+// Depth-agnostic on purpose: the five deployers nest component values
+// differently (a numbered values.yaml, an Argo CD Application source, a Flux
+// HelmRelease's spec.values), and pinning the layout per deployer would make
+// this test break on every unrelated bundle-shape change while still not
+// checking what it claims to.
+func collectRenderedValues(t *testing.T, root, key string) []any {
+	t.Helper()
+
+	var found []any
+	var walkNode func(node any)
+	walkNode = func(node any) {
+		switch typed := node.(type) {
+		case map[string]any:
+			for k, v := range typed {
+				if k == key {
+					found = append(found, v)
+				}
+				walkNode(v)
+			}
+		case []any:
+			for _, item := range typed {
+				walkNode(item)
+			}
+		}
+	}
+
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return err
+		}
+		if ext := filepath.Ext(path); ext != ".yaml" && ext != ".yml" {
+			return nil
+		}
+		raw, readErr := os.ReadFile(path) //nolint:gosec // path comes from WalkDir over a test temp dir.
+		if readErr != nil {
+			return readErr
+		}
+		decoder := yaml.NewDecoder(bytes.NewReader(raw))
+		for {
+			var doc any
+			decodeErr := decoder.Decode(&doc)
+			if stderrors.Is(decodeErr, io.EOF) {
+				return nil
+			}
+			if decodeErr != nil {
+				// Rendered bundles carry Helm templates that are not valid
+				// standalone YAML. Those are not where component values live,
+				// so skipping them is correct; failing here would make the
+				// test hostage to unrelated template content.
+				return nil
+			}
+			walkNode(doc)
+		}
+	})
+	if err != nil {
+		t.Fatalf("walk rendered bundle: %v", err)
+	}
+	return found
 }
 
 // TestK8sAIBOM_SystemSchedulingInjectionPaths proves the bundler injects
