@@ -49,6 +49,13 @@ mkdir -p "${OUTPUT_DIR}"
 
 cleanup() {
     local rc=$?
+    # The evidence directory is never removed, on success or failure: the
+    # AIBOM and BOM captures are the only record of why an assertion failed,
+    # and a cleanup that deletes them makes a failed run undiagnosable. Say
+    # where they are whenever the run did not succeed.
+    if [[ "${rc}" -ne 0 ]]; then
+        log_warning "Run failed; evidence retained in ${OUTPUT_DIR}"
+    fi
     if [[ "${KEEP_CLUSTER:-false}" == "true" ]]; then
         log_warning "KEEP_CLUSTER=true; leaving the cluster and ${FIXTURE_NS} in place"
         log_warning "Evidence: ${OUTPUT_DIR}"

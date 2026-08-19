@@ -365,12 +365,39 @@ image: chart, CRDs, status API, and image are one qualified set. Quiesce
 configuration changes during rollback and confirm that
 `AIBOMControllerConfig/default` returns to a current `Ready=True` state.
 
-Before uninstalling, remove the component reference from the custom overlay and
-regenerate the recipe. After applying the new bundle, delete retained AIBOMs
-and CRDs only after confirming no other release uses them:
+**Apply CRDs before the bundle upgrade.** The chart ships its CRDs under
+`crds/`, and Helm installs that directory only on first install — `helm
+upgrade`, `helmfile apply`, and every deployer built on them skip it. A chart
+bump whose CRDs changed therefore leaves the previous schema in place, and the
+new controller's writes to added fields are silently pruned by the API server.
+Apply the CRDs from the exact qualified chart first, then upgrade:
 
 ```bash
-kubectl delete aiboms.aibom.k8saibom.dev --all --all-namespaces
+helm show crds oci://ghcr.io/googlecloudplatform/charts/k8s-aibom \
+  --version <qualified-version> | kubectl apply --server-side -f -
+```
+
+Use `--server-side` because the CRDs exceed the annotation size limit that
+client-side apply depends on. Argo CD and Flux replace CRDs on sync when the
+chart is rendered through them, so this step is specific to the `helm` and
+`helmfile` deployers.
+
+Before uninstalling, remove the component reference from the custom overlay and
+regenerate the recipe, then uninstall the release with the deployer-appropriate
+procedure in [Bundle Uninstall](cli-reference.md#bundle-uninstall).
+
+Deleting the CRDs cascades to every AIBOM stored cluster-wide, including any
+belonging to a namespace or release you did not intend to touch. Enumerate
+before deleting rather than passing `--all`:
+
+```bash
+# Review what exists and who owns it; delete only what this release should own.
+kubectl get aiboms.aibom.k8saibom.dev --all-namespaces \
+  -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,OWNER:.metadata.ownerReferences[0].name
+kubectl -n <namespace> delete aiboms.aibom.k8saibom.dev <name>
+
+# CRDs last, and only once no other release uses them — deletion removes every
+# stored custom resource of these kinds cluster-wide.
 kubectl delete crd \
   aiboms.aibom.k8saibom.dev \
   aibomcontrollerconfigs.aibom.k8saibom.dev
